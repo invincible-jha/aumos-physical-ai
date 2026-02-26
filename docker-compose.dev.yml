@@ -1,0 +1,131 @@
+version: "3.9"
+
+services:
+  physical-ai:
+    build:
+      context: .
+      target: production
+    ports:
+      - "8000:8000"
+    environment:
+      - AUMOS_ENVIRONMENT=development
+      - AUMOS_DATABASE_URL=postgresql+asyncpg://aumos:aumos_dev@postgres:5432/aumos_physical_ai
+      - AUMOS_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - AUMOS_REDIS_URL=redis://redis:6379/0
+      - AUMOS_PHYSICAL_AI_BLENDERPROC_URL=http://blenderproc:9090
+      - AUMOS_PHYSICAL_AI_SENSOR_SIMULATOR_URL=http://sensor-sim:9091
+      - AUMOS_PHYSICAL_AI_MINIO_ENDPOINT=http://minio:9000
+      - AUMOS_PHYSICAL_AI_MINIO_ACCESS_KEY=minioadmin
+      - AUMOS_PHYSICAL_AI_MINIO_SECRET_KEY=minioadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - aumos-physical-ai
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aumos
+      POSTGRES_PASSWORD: aumos_dev
+      POSTGRES_DB: aumos_physical_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aumos -d aumos_physical_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aumos-physical-ai
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - aumos-physical-ai
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - aumos-physical-ai
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - aumos-physical-ai
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - aumos-physical-ai
+
+  # Stub services for local development
+  blenderproc:
+    image: python:3.11-slim
+    command: python -m http.server 9090
+    ports:
+      - "9090:9090"
+    networks:
+      - aumos-physical-ai
+
+  sensor-sim:
+    image: python:3.11-slim
+    command: python -m http.server 9091
+    ports:
+      - "9091:9091"
+    networks:
+      - aumos-physical-ai
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  aumos-physical-ai:
+    driver: bridge
