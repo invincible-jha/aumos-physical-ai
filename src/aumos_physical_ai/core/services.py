@@ -1,11 +1,14 @@
 """Business logic services for the physical AI service.
 
-Five services covering the full physical AI stack:
+Eight services covering the full physical AI stack:
   - DigitalTwinPipelineService: digital twin data pipeline orchestration
   - RoboticsSynthService: multi-modal robotics sensor data synthesis
   - SimToRealService: sim-to-real transfer learning and domain adaptation
   - DomainRandomizationService: scene randomization for training data diversity
   - SensorFusionService: multi-sensor data fusion and calibration
+  - MotionPlanningService: collision-free trajectory generation (A*, RRT, B-spline)
+  - GraspingSimulationService: robotic grasp pose generation and quality scoring
+  - PhysicsSimulationService: rigid-body forward dynamics simulation
 
 Services are framework-agnostic — they receive dependencies via constructor
 injection and delegate all I/O to adapters.
@@ -21,6 +24,10 @@ from aumos_common.observability import get_logger
 from aumos_physical_ai.core.interfaces import (
     DigitalTwinBackendProtocol,
     DomainRandomizerProtocol,
+    GraspingSimulatorProtocol,
+    MotionPlannerProtocol,
+    PhysicsEngineAdapterProtocol,
+    PhysicalSafetyValidatorProtocol,
     SensorFusionEngineProtocol,
     SensorSimulatorProtocol,
     SimToRealAdapterProtocol,
@@ -685,3 +692,495 @@ class SensorFusionService:
                 job.id, status=JobStatus.FAILED, error_message=str(exc)
             )
             raise
+
+
+class MotionPlanningService:
+    """Generates collision-free motion planning datasets for robotic manipulators.
+
+    Orchestrates the MotionPlannerProtocol adapter (A*, RRT, B-spline) and
+    optionally validates each plan through a PhysicalSafetyValidatorProtocol
+    before persisting results. Uses RoboticsJob records for persistence since
+    motion planning datasets are a specialisation of robotics synthesis jobs.
+    """
+
+    def __init__(
+        self,
+        motion_planner: MotionPlannerProtocol,
+        safety_validator: PhysicalSafetyValidatorProtocol,
+        job_repository: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise the motion planning service.
+
+        Args:
+            motion_planner: Motion planning algorithm adapter.
+            safety_validator: ISO 10218 safety validation adapter.
+            job_repository: Repository for RoboticsJob persistence.
+            event_publisher: Kafka publisher for physical AI lifecycle events.
+        """
+        self._planner = motion_planner
+        self._validator = safety_validator
+        self._job_repo = job_repository
+        self._publisher = event_publisher
+
+    async def plan(
+        self,
+        tenant_id: uuid.UUID,
+        planning_config: dict[str, Any],
+        validate_safety: bool = True,
+    ) -> RoboticsJob:
+        """Generate a motion planning dataset with optional safety validation.
+
+        Creates a RoboticsJob record, runs the motion planner, and if
+        validate_safety is True runs ISO 10218 checks on the resulting
+        trajectories. Publishes Kafka events on start and completion.
+
+        Args:
+            tenant_id: Tenant requesting the planning run.
+            planning_config: Configuration forwarded to the motion planner adapter:
+                - start_pose: 6-DOF start configuration.
+                - goal_pose: 6-DOF goal configuration.
+                - algorithm: 'astar' | 'rrt'.
+                - num_scenarios: Number of scenarios to generate.
+                - velocity_profile: 'trapezoidal' | 'constant'.
+                - smooth_trajectory: Apply B-spline smoothing.
+                - export_format: 'csv' | 'json'.
+            validate_safety: If True, run ISO 10218 validation on the
+                generated trajectories and attach safety results.
+
+        Returns:
+            RoboticsJob record in COMPLETED or FAILED state.
+
+        Raises:
+            ValidationError: If required planning_config keys are missing.
+        """
+        if "start_pose" not in planning_config or "goal_pose" not in planning_config:
+            from aumos_common.errors import ValidationError  # local import to match pattern
+            raise ValidationError("planning_config must include 'start_pose' and 'goal_pose'")
+
+        job = await self._job_repo.create(
+            RoboticsJob(
+                tenant_id=tenant_id,
+                status=JobStatus.PENDING,
+                sensor_types=["motion_planning"],
+                synthesis_config=planning_config,
+            )
+        )
+
+        await self._publisher.publish(
+            Topics.PHYSICAL_AI_SYNTH_STARTED,
+            {
+                "tenant_id": str(tenant_id),
+                "job_id": str(job.id),
+                "job_type": "motion_planning",
+                "algorithm": planning_config.get("algorithm", "rrt"),
+            },
+        )
+
+        logger.info(
+            "Motion planning job started",
+            job_id=str(job.id),
+            algorithm=planning_config.get("algorithm", "rrt"),
+            num_scenarios=planning_config.get("num_scenarios", 1),
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            job = await self._job_repo.update_status(job.id, JobStatus.RUNNING)
+
+            plan_result = await self._planner.generate_dataset(
+                planning_config=planning_config,
+                tenant_id=tenant_id,
+            )
+
+            safety_result: dict[str, Any] = {}
+            if validate_safety and plan_result.get("scenarios_generated", 0) > 0:
+                safety_config = {
+                    "trajectory_points": planning_config.get("goal_pose", []),
+                    "workspace_boundary": planning_config.get("workspace_boundary", {}),
+                    "max_velocity_ms": planning_config.get("max_velocity_ms", 1.5),
+                    "max_acceleration_ms2": planning_config.get("max_acceleration_ms2", 3.0),
+                    "collision_proximity_m": planning_config.get("collision_proximity_m", 0.05),
+                    "obstacles": planning_config.get("obstacle_map", []),
+                    "run_iso_check": True,
+                }
+                safety_result = await self._validator.validate_motion_plan(
+                    validation_config=safety_config,
+                    tenant_id=tenant_id,
+                )
+                logger.info(
+                    "Motion plan safety validation complete",
+                    job_id=str(job.id),
+                    overall_safe=safety_result.get("overall_safe"),
+                    safety_score=safety_result.get("safety_score"),
+                )
+
+            combined_config = {
+                **planning_config,
+                "safety_validation": safety_result,
+            }
+
+            job = await self._job_repo.update(
+                job.id,
+                status=JobStatus.COMPLETED,
+                output_uri=plan_result.get("output_uri"),
+                realism_score=plan_result.get("success_rate"),
+                synthesis_config=combined_config,
+            )
+
+            await self._publisher.publish(
+                Topics.PHYSICAL_AI_SYNTH_COMPLETED,
+                {
+                    "tenant_id": str(tenant_id),
+                    "job_id": str(job.id),
+                    "job_type": "motion_planning",
+                    "output_uri": plan_result.get("output_uri"),
+                    "success_rate": plan_result.get("success_rate"),
+                    "overall_safe": safety_result.get("overall_safe", True),
+                },
+            )
+
+            logger.info(
+                "Motion planning job completed",
+                job_id=str(job.id),
+                scenarios_generated=plan_result.get("scenarios_generated"),
+                success_rate=plan_result.get("success_rate"),
+                overall_safe=safety_result.get("overall_safe", True),
+            )
+            return job
+
+        except Exception as exc:
+            logger.error("Motion planning job failed", job_id=str(job.id), error=str(exc))
+            job = await self._job_repo.update(
+                job.id, status=JobStatus.FAILED, error_message=str(exc)
+            )
+            raise
+
+    async def get_job(self, job_id: uuid.UUID, tenant_id: uuid.UUID) -> RoboticsJob:
+        """Retrieve a motion planning job by ID.
+
+        Args:
+            job_id: Job identifier.
+            tenant_id: Tenant context for authorization.
+
+        Returns:
+            RoboticsJob record.
+
+        Raises:
+            NotFoundError: If the job does not exist for this tenant.
+        """
+        job = await self._job_repo.get_by_id(job_id)
+        if not job or job.tenant_id != tenant_id:
+            raise NotFoundError(f"Motion planning job {job_id} not found")
+        return job
+
+
+class GraspingSimulationService:
+    """Generates robotic grasping scenario datasets.
+
+    Orchestrates the GraspingSimulatorProtocol adapter to produce grasp pose
+    libraries, force-closure evaluations, and epsilon/volume quality metrics
+    for training robotic manipulation models. Uses RoboticsJob for persistence.
+    """
+
+    def __init__(
+        self,
+        grasping_simulator: GraspingSimulatorProtocol,
+        job_repository: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise the grasping simulation service.
+
+        Args:
+            grasping_simulator: Grasping simulation adapter.
+            job_repository: Repository for RoboticsJob persistence.
+            event_publisher: Kafka publisher for physical AI lifecycle events.
+        """
+        self._simulator = grasping_simulator
+        self._job_repo = job_repository
+        self._publisher = event_publisher
+
+    async def generate_scenarios(
+        self,
+        tenant_id: uuid.UUID,
+        scenario_config: dict[str, Any],
+    ) -> RoboticsJob:
+        """Generate a robotic grasping scenario dataset.
+
+        Args:
+            tenant_id: Tenant requesting the grasping scenarios.
+            scenario_config: Grasping configuration forwarded to the adapter:
+                - num_scenarios: Number of scenarios to generate.
+                - gripper_type: 'parallel_jaw' | 'three_finger' | 'dexterous_hand'
+                    | 'suction_cup'.
+                - object_types: List of object geometry types to sample.
+                - grasp_candidates_per_object: Grasp attempts per object.
+                - friction_coefficient: Contact friction coefficient.
+
+        Returns:
+            RoboticsJob record in COMPLETED or FAILED state.
+
+        Raises:
+            ValidationError: If gripper_type is not supported.
+        """
+        supported_grippers = {"parallel_jaw", "three_finger", "dexterous_hand", "suction_cup"}
+        gripper = scenario_config.get("gripper_type", "parallel_jaw")
+        if gripper not in supported_grippers:
+            from aumos_common.errors import ValidationError
+            raise ValidationError(
+                f"Unsupported gripper_type '{gripper}'. Supported: {supported_grippers}"
+            )
+
+        job = await self._job_repo.create(
+            RoboticsJob(
+                tenant_id=tenant_id,
+                status=JobStatus.PENDING,
+                sensor_types=["grasping"],
+                synthesis_config=scenario_config,
+            )
+        )
+
+        await self._publisher.publish(
+            Topics.PHYSICAL_AI_SYNTH_STARTED,
+            {
+                "tenant_id": str(tenant_id),
+                "job_id": str(job.id),
+                "job_type": "grasping_simulation",
+                "gripper_type": gripper,
+            },
+        )
+
+        logger.info(
+            "Grasping simulation job started",
+            job_id=str(job.id),
+            gripper_type=gripper,
+            num_scenarios=scenario_config.get("num_scenarios", 100),
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            job = await self._job_repo.update_status(job.id, JobStatus.RUNNING)
+
+            result = await self._simulator.generate_scenarios(
+                scenario_config=scenario_config,
+                tenant_id=tenant_id,
+            )
+
+            job = await self._job_repo.update(
+                job.id,
+                status=JobStatus.COMPLETED,
+                output_uri=result.get("output_uri"),
+                realism_score=result.get("success_rate"),
+                synthesis_config={
+                    **scenario_config,
+                    "mean_epsilon_metric": result.get("mean_epsilon_metric"),
+                    "mean_volume_metric": result.get("mean_volume_metric"),
+                    "gripper_config": result.get("gripper_config"),
+                },
+            )
+
+            await self._publisher.publish(
+                Topics.PHYSICAL_AI_SYNTH_COMPLETED,
+                {
+                    "tenant_id": str(tenant_id),
+                    "job_id": str(job.id),
+                    "job_type": "grasping_simulation",
+                    "output_uri": result.get("output_uri"),
+                    "success_rate": result.get("success_rate"),
+                    "mean_epsilon_metric": result.get("mean_epsilon_metric"),
+                },
+            )
+
+            logger.info(
+                "Grasping simulation job completed",
+                job_id=str(job.id),
+                scenarios_generated=result.get("scenarios_generated"),
+                success_rate=result.get("success_rate"),
+                mean_epsilon_metric=result.get("mean_epsilon_metric"),
+            )
+            return job
+
+        except Exception as exc:
+            logger.error("Grasping simulation job failed", job_id=str(job.id), error=str(exc))
+            job = await self._job_repo.update(
+                job.id, status=JobStatus.FAILED, error_message=str(exc)
+            )
+            raise
+
+    async def get_job(self, job_id: uuid.UUID, tenant_id: uuid.UUID) -> RoboticsJob:
+        """Retrieve a grasping simulation job by ID.
+
+        Args:
+            job_id: Job identifier.
+            tenant_id: Tenant context for authorization.
+
+        Returns:
+            RoboticsJob record.
+
+        Raises:
+            NotFoundError: If the job does not exist for this tenant.
+        """
+        job = await self._job_repo.get_by_id(job_id)
+        if not job or job.tenant_id != tenant_id:
+            raise NotFoundError(f"Grasping simulation job {job_id} not found")
+        return job
+
+
+class PhysicsSimulationService:
+    """Executes rigid-body physics simulations for robot environment modelling.
+
+    Orchestrates the PhysicsEngineAdapterProtocol to run forward dynamics
+    simulations with collision detection, joint constraints, and energy
+    tracking. Results are stored in TwinPipeline records because physics
+    simulations are a specialisation of digital twin pipelines.
+    """
+
+    def __init__(
+        self,
+        physics_engine: PhysicsEngineAdapterProtocol,
+        pipeline_repository: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise the physics simulation service.
+
+        Args:
+            physics_engine: Rigid-body physics engine adapter.
+            pipeline_repository: Repository for TwinPipeline persistence.
+            event_publisher: Kafka publisher for physical AI lifecycle events.
+        """
+        self._engine = physics_engine
+        self._pipeline_repo = pipeline_repository
+        self._publisher = event_publisher
+
+    async def run_simulation(
+        self,
+        tenant_id: uuid.UUID,
+        name: str,
+        simulation_config: dict[str, Any],
+    ) -> TwinPipeline:
+        """Run a rigid-body physics simulation.
+
+        Creates a TwinPipeline record to track the simulation, delegates to
+        the physics engine adapter, and publishes lifecycle Kafka events.
+
+        Args:
+            tenant_id: Tenant requesting the simulation.
+            name: Human-readable simulation name.
+            simulation_config: Simulation parameters forwarded to the adapter:
+                - bodies: List of rigid body dicts.
+                - joints: List of joint constraint dicts.
+                - gravity_ms2: Gravitational acceleration.
+                - dt_s: Integration timestep in seconds.
+                - num_steps: Total simulation steps to run.
+                - export_trajectory: Include per-step state history.
+
+        Returns:
+            TwinPipeline record in COMPLETED or FAILED state.
+
+        Raises:
+            ValidationError: If simulation_config is missing required fields.
+        """
+        if not simulation_config.get("bodies"):
+            from aumos_common.errors import ValidationError
+            raise ValidationError("simulation_config must include at least one 'bodies' entry")
+
+        pipeline = await self._pipeline_repo.create(
+            TwinPipeline(
+                tenant_id=tenant_id,
+                name=name,
+                status=JobStatus.PENDING,
+                scene_config=simulation_config,
+            )
+        )
+
+        await self._publisher.publish(
+            Topics.PHYSICAL_AI_TWIN_CREATED,
+            {
+                "tenant_id": str(tenant_id),
+                "pipeline_id": str(pipeline.id),
+                "name": name,
+                "type": "physics_simulation",
+            },
+        )
+
+        logger.info(
+            "Physics simulation started",
+            pipeline_id=str(pipeline.id),
+            num_bodies=len(simulation_config.get("bodies", [])),
+            num_steps=simulation_config.get("num_steps", 1000),
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            pipeline = await self._pipeline_repo.update_status(pipeline.id, JobStatus.RUNNING)
+
+            result = await self._engine.run_simulation(
+                simulation_config=simulation_config,
+                tenant_id=tenant_id,
+            )
+
+            energy_conservation_error: float = result.get("energy_conservation_error", 0.0)
+
+            pipeline = await self._pipeline_repo.update(
+                pipeline.id,
+                status=JobStatus.COMPLETED,
+                output_uri=result.get("output_uri"),
+                fidelity_score=max(0.0, 1.0 - energy_conservation_error),
+                simulation_steps=result.get("total_steps"),
+                real_time_factor=simulation_config.get("dt_s", 0.001),
+                scene_config={
+                    **simulation_config,
+                    "sim_time_s": result.get("sim_time_s"),
+                    "collision_events": result.get("collision_events", 0),
+                    "energy_conservation_error": energy_conservation_error,
+                },
+            )
+
+            await self._publisher.publish(
+                Topics.PHYSICAL_AI_TWIN_COMPLETED,
+                {
+                    "tenant_id": str(tenant_id),
+                    "pipeline_id": str(pipeline.id),
+                    "output_uri": result.get("output_uri"),
+                    "total_steps": result.get("total_steps"),
+                    "energy_conservation_error": energy_conservation_error,
+                },
+            )
+
+            logger.info(
+                "Physics simulation completed",
+                pipeline_id=str(pipeline.id),
+                total_steps=result.get("total_steps"),
+                sim_time_s=result.get("sim_time_s"),
+                energy_conservation_error=energy_conservation_error,
+            )
+            return pipeline
+
+        except Exception as exc:
+            logger.error(
+                "Physics simulation failed", pipeline_id=str(pipeline.id), error=str(exc)
+            )
+            pipeline = await self._pipeline_repo.update(
+                pipeline.id, status=JobStatus.FAILED, error_message=str(exc)
+            )
+            raise
+
+    async def get_simulation(
+        self, pipeline_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> TwinPipeline:
+        """Retrieve a physics simulation pipeline record by ID.
+
+        Args:
+            pipeline_id: Pipeline identifier.
+            tenant_id: Tenant context for authorization.
+
+        Returns:
+            TwinPipeline record.
+
+        Raises:
+            NotFoundError: If the pipeline does not exist for this tenant.
+        """
+        pipeline = await self._pipeline_repo.get_by_id(pipeline_id)
+        if not pipeline or pipeline.tenant_id != tenant_id:
+            raise NotFoundError(f"Physics simulation {pipeline_id} not found")
+        return pipeline

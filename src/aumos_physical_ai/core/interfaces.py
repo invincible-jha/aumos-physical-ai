@@ -212,3 +212,145 @@ class SensorFusionEngineProtocol(Protocol):
             spatial_calibration_score, fusion_quality_score.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# New adapter protocols for motion planning, grasping, safety, and physics
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class MotionPlannerProtocol(Protocol):
+    """Contract for robotic motion planning adapters.
+
+    Implementations generate collision-free joint-space and task-space
+    trajectories for robotic manipulators using algorithms such as A*,
+    RRT, and B-spline smoothing.
+    """
+
+    async def generate_dataset(
+        self,
+        planning_config: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Generate a motion-planning dataset from the supplied configuration.
+
+        Args:
+            planning_config: Planning parameters including:
+                - start_pose: List[float] — 6-DOF start configuration.
+                - goal_pose: List[float] — 6-DOF goal configuration.
+                - algorithm: 'astar' | 'rrt' — path planning algorithm.
+                - obstacle_map: List of obstacle dicts (center, half_extents).
+                - velocity_profile: 'trapezoidal' | 'constant'.
+                - smooth_trajectory: bool — apply B-spline smoothing.
+                - num_scenarios: int — number of planning scenarios.
+                - export_format: 'csv' | 'json'.
+            tenant_id: Tenant context for output namespacing.
+
+        Returns:
+            Dict with output_uri, scenarios_generated, success_rate,
+            mean_path_length, mean_planning_time_ms, export_format.
+        """
+        ...
+
+
+@runtime_checkable
+class GraspingSimulatorProtocol(Protocol):
+    """Contract for robotic grasping simulation adapters.
+
+    Implementations generate diverse grasp poses, evaluate force closure,
+    and compute grasp quality metrics (epsilon and volume) for training
+    robotic manipulation models.
+    """
+
+    async def generate_scenarios(
+        self,
+        scenario_config: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Generate grasping simulation scenarios.
+
+        Args:
+            scenario_config: Scenario configuration including:
+                - num_scenarios: int — number of grasping scenarios.
+                - gripper_type: 'parallel_jaw' | 'three_finger' | 'dexterous_hand'
+                    | 'suction_cup'.
+                - object_types: List[str] — object geometry types to sample.
+                - grasp_candidates_per_object: int — grasp attempts per object.
+                - friction_coefficient: float — contact friction coefficient.
+            tenant_id: Tenant context for output namespacing.
+
+        Returns:
+            Dict with output_uri, scenarios_generated, success_rate,
+            mean_epsilon_metric, mean_volume_metric, gripper_config.
+        """
+        ...
+
+
+@runtime_checkable
+class PhysicalSafetyValidatorProtocol(Protocol):
+    """Contract for ISO 10218 robotic safety validation adapters.
+
+    Implementations check motion plans against workspace boundaries,
+    velocity limits, collision proximity thresholds, and emergency stop
+    scenarios per ISO 10218-1:2011 and ISO 10218-2:2011.
+    """
+
+    async def validate_motion_plan(
+        self,
+        validation_config: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Validate a motion plan against physical safety requirements.
+
+        Args:
+            validation_config: Validation parameters including:
+                - trajectory_points: List of 6-DOF joint configurations.
+                - workspace_boundary: Dict with min/max bounds per axis (m).
+                - max_velocity_ms: float — maximum allowable end-effector speed.
+                - max_acceleration_ms2: float — maximum allowable acceleration.
+                - collision_proximity_m: float — minimum clearance from obstacles.
+                - obstacles: List of obstacle dicts (center, half_extents).
+                - run_iso_check: bool — run ISO 10218 clause checks.
+            tenant_id: Tenant context for audit logging.
+
+        Returns:
+            Dict with overall_safe, safety_score, tests (list of test results),
+            iso_compliance, findings, recommendations.
+        """
+        ...
+
+
+@runtime_checkable
+class PhysicsEngineAdapterProtocol(Protocol):
+    """Contract for rigid-body physics simulation adapters.
+
+    Implementations execute forward dynamics simulations for articulated
+    rigid bodies, detecting ground plane collisions, enforcing joint limits,
+    and tracking kinetic and potential energy conservation.
+    """
+
+    async def run_simulation(
+        self,
+        simulation_config: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Run a rigid-body physics simulation.
+
+        Args:
+            simulation_config: Simulation parameters including:
+                - bodies: List of rigid body dicts (name, mass_kg, position,
+                    velocity, inertia_tensor, shape, dimensions).
+                - joints: List of joint dicts (body_a, body_b, type,
+                    axis, limits_rad, stiffness, damping).
+                - gravity_ms2: float — gravitational acceleration (default 9.81).
+                - dt_s: float — integration timestep in seconds.
+                - num_steps: int — total simulation steps to execute.
+                - export_trajectory: bool — include per-step state in output.
+            tenant_id: Tenant context for output namespacing.
+
+        Returns:
+            Dict with output_uri, total_steps, sim_time_s, final_state,
+            energy_conservation_error, collision_events, joints_enforced.
+        """
+        ...
