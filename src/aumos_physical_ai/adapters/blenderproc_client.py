@@ -59,7 +59,8 @@ class BlenderProcClient(DigitalTwinBackendProtocol, DomainRandomizerProtocol):
 
         # TODO: Implement actual BlenderProc REST API call
         # POST /api/v1/scenes with scene_config payload
-        pipeline_id = f"bp-{tenant_id!s[:8]}-{scene_config.get('world_model', 'scene')}"
+        tid = str(tenant_id)[:8]
+        pipeline_id = f"bp-{tid}-{scene_config.get('world_model', 'scene')}"
 
         return {
             "pipeline_id": pipeline_id,
@@ -143,7 +144,7 @@ class BlenderProcClient(DigitalTwinBackendProtocol, DomainRandomizerProtocol):
         # TODO: Implement actual BlenderProc randomization
         # POST /api/v1/randomize with randomization_params
         return {
-            "output_uri": f"s3://aumos-physical-ai/randomized/{tenant_id!s[:8]}",
+            "output_uri": f"s3://aumos-physical-ai/randomized/{str(tenant_id)[:8]}",
             "variations_generated": num_variations,
             "diversity_score": 0.82,
             "coverage_score": 0.78,

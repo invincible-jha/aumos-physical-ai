@@ -89,7 +89,7 @@ class SimToRealAdapter(SimToRealAdapterProtocol):
         metrics = method_metrics.get(transfer_method, {"real_accuracy": 0.75, "domain_gap_score": 0.15})
 
         adapted_model_uri = (
-            f"s3://aumos-physical-ai/models/{tenant_id!s[:8]}/"
+            f"s3://aumos-physical-ai/models/{str(tenant_id)[:8]}/"
             f"{source_model_id}/{transfer_method}_adapted"
         )
 

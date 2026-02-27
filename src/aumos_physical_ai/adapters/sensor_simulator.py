@@ -68,7 +68,7 @@ class SensorSimulator(SensorSimulatorProtocol):
 
         for sensor_type in sensor_types:
             output_uri = (
-                f"s3://aumos-physical-ai/synth/{tenant_id!s[:8]}/{scene}/{sensor_type}"
+                f"s3://aumos-physical-ai/synth/{str(tenant_id)[:8]}/{scene}/{sensor_type}"
             )
             per_sensor_uris[sensor_type] = output_uri
 
@@ -95,7 +95,7 @@ class SensorSimulator(SensorSimulatorProtocol):
         # TODO: Implement actual HTTP/gRPC calls to sensor simulator service
         # POST /api/v1/synthesize with full payload
 
-        bundle_uri = f"s3://aumos-physical-ai/synth/{tenant_id!s[:8]}/{scene}/bundle"
+        bundle_uri = f"s3://aumos-physical-ai/synth/{str(tenant_id)[:8]}/{scene}/bundle"
 
         return {
             "output_uri": bundle_uri,
@@ -177,7 +177,7 @@ class SensorFusionEngine(SensorFusionEngineProtocol):
         # POST /api/v1/fusion with sensor_streams and fusion_config
 
         output_uri = (
-            f"s3://aumos-physical-ai/fusion/{tenant_id!s[:8]}/"
+            f"s3://aumos-physical-ai/fusion/{str(tenant_id)[:8]}/"
             f"{fusion_strategy}/{output_format}"
         )
 
